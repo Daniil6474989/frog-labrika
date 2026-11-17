@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Технический аудит сайта</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg viewBox="0 0 48 48" aria-hidden="true">
+        <rect x="4" y="16" width="40" height="24" rx="12"></rect>
+        <circle cx="18" cy="14" r="6"></circle>
+        <circle cx="30" cy="14" r="6"></circle>
+        <circle cx="18" cy="26" r="2.2"></circle>
+        <circle cx="30" cy="26" r="2.2"></circle>
+        <path d="M18 33c2.4 2 9.6 2 12 0"></path>
+      </svg>
+      <div>
+        <p class="eyebrow">Обход страниц и список правок</p>
+        <h1>Технический аудит</h1>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <form id="form" class="panel">
+      <label class="url">
+        <span>Адрес сайта</span>
+        <input name="url" type="text" inputmode="url" placeholder="https://example.com" autocomplete="url" required>
+      </label>
+      <label>
+        <span>Страниц</span>
+        <select name="max_pages">
+          <option value="500">500</option>
+          <option value="2000">2 000</option>
+          <option value="10000">10 000</option>
+          <option value="20000">20 000</option>
+          <option value="100000" selected>100 000</option>
+          <option value="500000">все найденные</option>
+        </select>
+      </label>
+      <label>
+        <span>Глубина</span>
+        <select name="max_depth">
+          <option value="2">2</option>
+          <option value="4" selected>4</option>
+          <option value="8">8</option>
+        </select>
+      </label>
+      <label class="check">
+        <input name="robots" type="checkbox" checked>
+        <span>Учитывать robots.txt</span>
+      </label>
+      <button type="submit">Проверить сайт</button>
+      <p class="hint">Берутся все найденные адреса, включая фильтры и страницы пагинации. Одинаковая ошибка HTML пишется один раз вместе с числом повторов. JavaScript сайта не исполняется.</p>
+    </form>
+
+    <section id="live" class="panel live" hidden></section>
+    <section id="report" hidden></section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
