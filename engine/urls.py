@@ -42,9 +42,7 @@ def normalize(url: str) -> str:
         netloc = f"{host_idna}:{port}"
     else:
         netloc = host_idna
-    path = re.sub(r"/{2,}", "/", parts.path or "/")
-    if path != "/" and path.endswith("/"):
-        path = path[:-1]
+    path = re.sub(r"/{2,}", "/", parts.path or "/") or "/"
     query = []
     for key, value in parse_qsl(parts.query, keep_blank_values=True):
         lowered = key.lower()
@@ -52,6 +50,26 @@ def normalize(url: str) -> str:
             continue
         query.append((key, value))
     return urlunsplit((scheme, netloc, path, urlencode(query), ""))
+
+
+def document_key(url: str) -> str:
+    """Один ключ для зеркал: http/https, www и конечный слэш — та же страница."""
+    try:
+        normalized = normalize(url)
+    except Exception:
+        normalized = (url or "").strip()
+    parts = urlsplit(normalized)
+    host = host_key(parts.hostname or "")
+    if parts.port and parts.port not in (80, 443):
+        host = f"{host}:{parts.port}"
+    path = parts.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    return f"{host}{path}?{parts.query}" if parts.query else f"{host}{path}"
+
+
+def same_document(left: str, right: str) -> bool:
+    return bool(left) and bool(right) and document_key(left) == document_key(right)
 
 
 def same_site(url: str, site_key: str) -> bool:

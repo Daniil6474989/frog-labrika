@@ -17,7 +17,8 @@ def _place(raw: bytes, at: int) -> str:
 def inspect_html(raw: bytes) -> list[dict]:
     issues: list[dict] = []
     lowered = raw.lower()
-    charset_at = lowered.find(b"charset")
+    meta_charset = re.search(br"<meta[^>]*charset", lowered)
+    charset_at = meta_charset.start() if meta_charset else -1
     if charset_at >= 1024:
         issues.append(
             {
@@ -30,16 +31,6 @@ def inspect_html(raw: bytes) -> list[dict]:
 
     text = raw.decode("utf-8", "replace")
     low = text.lower()
-    body_at = low.find("<body")
-    if body_at >= 0:
-        style_at = low.find("<style", body_at)
-        if style_at >= 0:
-            issues.append(
-                {
-                    "detail": "Элемент style стоит внутри body, а не в head.",
-                    "where": _place(raw, style_at),
-                }
-            )
     if text.count("<!--") != text.count("-->"):
         comment_at = low.find("<!--")
         issues.append(

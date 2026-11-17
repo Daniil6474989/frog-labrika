@@ -14,7 +14,7 @@ from .htmlissues import inspect_html
 from .parse import decode_body, is_html, parse_html
 from .robots import Robots
 from .sitemaps import load_sitemaps, robots_warnings
-from .urls import assert_public_url, host_key, normalize, same_site
+from .urls import assert_public_url, document_key, host_key, normalize, same_document, same_site
 
 _SKIP_EXT = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".pdf", ".zip",
@@ -49,7 +49,7 @@ def _classify(url: str, status: int, html_ok: bool, parsed, x_robots: str, error
         return False, "noindex"
     if parsed and parsed.canonical:
         canon = normalize(parsed.canonical)
-        if urlsplit(canon).scheme in ("http", "https") and canon != normalize(url):
+        if urlsplit(canon).scheme in ("http", "https") and not same_document(canon, url):
             return False, "canonical на другой адрес"
     return True, "можно индексировать"
 
@@ -415,10 +415,14 @@ def crawl(
             linked.add(dest)
             if dest in alias:
                 linked.add(alias[dest])
+    crawled_keys = {document_key(url) for url in pages}
+    crawled_keys.update(document_key(url) for url in alias)
     need = []
     for url in sitemap_urls:
         target = alias.get(url, url)
         if url in pages or target in pages:
+            continue
+        if document_key(url) in crawled_keys or document_key(target) in crawled_keys:
             continue
         need.append(url)
         extra_status[url] = {"status": None, "final": url, "error": None, "unvisited": True}

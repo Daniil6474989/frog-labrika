@@ -4,11 +4,13 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from datetime import datetime
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from .model import CrawlData, Page
 from .net import REDIRECTS
-from .urls import normalize
+from .urls import document_key, normalize, same_document
+
+_CLIENT_GONE = {404, 410}
 
 _SEVERITY = {"critical": 0, "warning": 1, "notice": 2}
 
@@ -29,6 +31,33 @@ def _chain_text(event: dict) -> str:
     for hop in event.get("chain") or []:
         parts.append(f"{hop.get('status')} {hop.get('location') or ''}".strip())
     return " → ".join(parts)
+
+
+def _redirect_target(event: dict) -> str:
+    target = event.get("to") or ""
+    if target:
+        return target
+    chain = event.get("chain") or []
+    if chain:
+        return chain[-1].get("location") or ""
+    return ""
+
+
+def _canonical_redirect(event: dict) -> bool:
+    """Склейка зеркала: слэш, www, http→https. Это не ошибка внутренних ссылок."""
+    target = _redirect_target(event)
+    return bool(target) and same_document(event.get("from") or "", target)
+
+
+def _https_location(location: str, source: str) -> bool:
+    if not location:
+        return False
+    absolute = urljoin(source or "", location)
+    return urlsplit(absolute).scheme == "https"
+
+
+def _known_keys(urls) -> set[str]:
+    return {document_key(url) for url in urls if url}
 
 
 def _page_public(page: Page) -> dict:
@@ -189,7 +218,7 @@ def build_report(data: CrawlData) -> dict:
             penalty=min(24, 8 * len(server_errors)),
         )
 
-    broken = [page.url for page in pages if 400 <= page.status < 500 and page.url != home_url]
+    broken = [page.url for page in pages if page.status in _CLIENT_GONE and page.url != home_url]
     if broken:
         add(
             "broken-internal",
@@ -217,8 +246,9 @@ def build_report(data: CrawlData) -> dict:
 
     if isinstance(data.http_probe, dict):
         status = data.http_probe.get("status") or 0
-        location = (data.http_probe.get("location") or "").strip().lower()
-        if status == 200 or (status in REDIRECTS and not location.startswith("https://")):
+        location = (data.http_probe.get("location") or "").strip()
+        probe_url = data.http_probe.get("url") or ""
+        if status == 200 or (status in REDIRECTS and not _https_location(location, probe_url)):
             add(
                 "http-not-redirect",
                 "warning",
@@ -265,16 +295,20 @@ def build_report(data: CrawlData) -> dict:
             penalty=8,
         )
     elif not data.blocks_all and data.sitemap_files:
-        image_errors = sum(int(item.get("errors") or 0) for item in data.sitemap_files)
-        if image_errors:
+        broken_maps = [
+            item["url"]
+            for item in data.sitemap_files
+            if int(item.get("errors") or 0) and not item.get("checked")
+        ]
+        if broken_maps:
             add(
-                "sitemap-images",
+                "sitemap-broken",
                 "warning",
                 "Карта сайта",
-                "В карте сайта указаны адреса картинок",
-                f"{image_errors} записей ведут на файл изображения, а не на HTML-страницу. "
-                "Поисковая карта из-за этого раздувается, а часть адресов не является страницами.",
-                "Оставьте в sitemap только адреса страниц. Картинки поисковик забирает с самой страницы.",
+                "Карта сайта не читается",
+                "Адрес sitemap указан, но XML с адресами страниц не разобрался.",
+                "Откройте sitemap в браузере: это должен быть XML со списком <loc>.",
+                urls=broken_maps,
                 penalty=8,
             )
     elif not data.blocks_all and not data.sitemap_urls:
@@ -288,18 +322,18 @@ def build_report(data: CrawlData) -> dict:
             penalty=6,
         )
 
+    pages_by_key = {document_key(page.url): page for page in pages}
     bad_sitemap = []
     for url in data.sitemap_urls:
-        target = url
-        page = data.pages.get(url)
-        if page is None:
-            page = data.pages.get(target)
+        page = data.pages.get(url) or pages_by_key.get(document_key(url))
         if page:
-            if page.status != 200:
+            if page.status not in (200, *REDIRECTS) and page.status not in (401, 403):
                 bad_sitemap.append(f"{url} → {page.status}")
             continue
         extra = data.extra_status.get(url)
-        if extra and not extra.get("unvisited") and extra.get("status") not in (200, *REDIRECTS):
+        if extra and extra.get("unvisited"):
+            continue
+        if extra and extra.get("status") not in (200, *REDIRECTS, None) and extra.get("status") not in (401, 403):
             bad_sitemap.append(f"{url} → {extra.get('status') or extra.get('error') or 'ошибка'}")
     if bad_sitemap:
         add(
@@ -315,21 +349,24 @@ def build_report(data: CrawlData) -> dict:
         )
 
     if data.sitemap_urls and not data.partial:
+        linked_keys = _known_keys(data.linked)
+        if home_url:
+            linked_keys.add(document_key(home_url))
         orphans = []
         for url, extra in data.extra_status.items():
             if extra.get("status") != 200:
                 continue
             final = extra.get("final") or url
-            if url == home_url or final == home_url:
+            if same_document(url, home_url or "") or same_document(final, home_url or ""):
                 continue
-            if url in data.linked or final in data.linked:
+            if document_key(url) in linked_keys or document_key(final) in linked_keys:
                 continue
-            if final in data.pages and (final in data.linked or data.pages[final].inlinks):
+            if final in data.pages and (document_key(final) in linked_keys or data.pages[final].inlinks):
                 continue
             orphans.append(url)
-        known = set(data.sitemap_urls)
+        known = _known_keys(data.sitemap_urls)
         for page in pages:
-            if page.url in known and page.status == 200 and page.inlinks == 0 and page.url != home_url and page.depth > 0:
+            if document_key(page.url) in known and page.status == 200 and page.inlinks == 0 and page.url != home_url and page.depth > 0:
                 orphans.append(page.url)
         orphans = list(dict.fromkeys(orphans))
         if orphans:
@@ -345,8 +382,8 @@ def build_report(data: CrawlData) -> dict:
             )
 
     if data.sitemap_urls:
-        known = set(data.sitemap_urls)
-        missing = [page.url for page in indexable if page.url not in known]
+        known = _known_keys(data.sitemap_urls)
+        missing = [page.url for page in indexable if document_key(page.url) not in known]
         if missing:
             add(
                 "not-in-sitemap",
@@ -359,7 +396,11 @@ def build_report(data: CrawlData) -> dict:
                 penalty=min(6, 2 + len(missing) // 4),
             )
 
-    long_chains = [event for event in data.redirect_events if event.get("hops", 0) >= 2]
+    long_chains = [
+        event
+        for event in data.redirect_events
+        if event.get("hops", 0) >= 2 and not _canonical_redirect(event)
+    ]
     if long_chains:
         add(
             "redirect-chains",
@@ -372,7 +413,11 @@ def build_report(data: CrawlData) -> dict:
             urls=[event["from"] for event in long_chains],
             penalty=min(10, 4 * len(long_chains)),
         )
-    single_hops = [event for event in data.redirect_events if event.get("hops", 0) == 1]
+    single_hops = [
+        event
+        for event in data.redirect_events
+        if event.get("hops", 0) == 1 and not _canonical_redirect(event)
+    ]
     if single_hops:
         add(
             "redirect-links",
@@ -569,25 +614,16 @@ def build_report(data: CrawlData) -> dict:
             penalty=min(10, 4 * len(dup_body)),
         )
 
-    missing_canon = [page.url for page in indexable if not page.canonical]
-    if missing_canon:
-        add(
-            "missing-canonical",
-            "notice",
-            "Индексация",
-            "Не указан canonical",
-            "Без canonical поисковик сам выбирает основной адрес, если страница доступна в нескольких вариантах.",
-            "Поставьте rel=canonical на конечный адрес этой же страницы.",
-            urls=missing_canon,
-            penalty=2,
-        )
     bad_canon = []
-    for page in ok_pages:
+    for page in indexable:
         if not page.canonical:
             continue
         canon = normalize(page.canonical)
-        if urlsplit(canon).scheme in ("http", "https") and canon != page.url:
-            bad_canon.append(page.url)
+        if urlsplit(canon).scheme not in ("http", "https"):
+            continue
+        if same_document(canon, page.url):
+            continue
+        bad_canon.append(page.url)
     if bad_canon:
         add(
             "bad-canonical",
@@ -598,23 +634,6 @@ def build_report(data: CrawlData) -> dict:
             "На уникальной странице canonical должен указывать на неё саму. Чужой canonical — только если это сознательный дубль.",
             urls=bad_canon,
             penalty=min(8, 3 * len(bad_canon)),
-        )
-
-    noindex = [
-        page.url
-        for page in ok_pages
-        if page.url != home_url and "noindex" in page.index_reason
-    ]
-    if noindex:
-        add(
-            "noindex",
-            "notice",
-            "Индексация",
-            "Страницы закрыты от индекса",
-            "На этих адресах стоит noindex. Если так и задумано для служебных страниц — это нормально.",
-            "Проверьте, что закрыты только те страницы, которых не должно быть в поиске.",
-            urls=noindex,
-            penalty=2,
         )
 
     no_viewport = [page.url for page in indexable if not page.viewport]
@@ -756,7 +775,7 @@ def build_report(data: CrawlData) -> dict:
     for page in ok_pages:
         if not page.hreflang:
             continue
-        if not any(normalize(item.get("href") or "") == page.url for item in page.hreflang):
+        if not any(same_document(item.get("href") or "", page.url) for item in page.hreflang):
             bad_lang.append(page.url)
     if bad_lang:
         add(
@@ -850,7 +869,7 @@ def _pack(data: CrawlData, issues: list[dict], pages: list[Page], home: Page | N
     if data.partial:
         limitations.insert(
             0,
-            "Обход открыл не все страницы каталога. Адреса из sitemap, которые не открывались, лежат в листе «Нет на сайте» с кодом «—»: это не подтверждённый 404.",
+            "Обход открыл не все страницы каталога. Неоткрытые адреса из sitemap не записываются как 404.",
         )
     return {
         "summary": {

@@ -195,7 +195,7 @@ class _Parser(HTMLParser):
                 self._collect(href)
         if tag == "img":
             self.images += 1
-            if "alt" not in attr or not str(attr.get("alt", "")).strip():
+            if "alt" not in attr:
                 self.images_missing_alt += 1
             src = self._abs(attr.get("src") or attr.get("data-src") or "")
             if src:
@@ -386,7 +386,7 @@ def _parse_fast(html: str, page_url: str, site_key: str) -> Parsed:
     for node in tree.css("img"):
         parsed.images += 1
         attrs = _attrs(node)
-        if "alt" not in attrs or not str(attrs.get("alt") or "").strip():
+        if "alt" not in attrs:
             parsed.images_missing_alt += 1
         src = absolute(attrs.get("src") or attrs.get("data-src") or "")
         if src:

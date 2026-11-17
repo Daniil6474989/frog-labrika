@@ -92,6 +92,18 @@ class Site(BaseHTTPRequestHandler):
         if path == "/gone":
             self._send(404, "нет", "text/plain; charset=utf-8")
             return
+        if path == "/login":
+            self._send(403, "нет", "text/plain; charset=utf-8")
+            return
+        if path == "/catalog":
+            self._redirect(base + "/catalog/")
+            return
+        if path == "/catalog/":
+            self._send(200, _page(
+                "Каталог с каноническим слэшем",
+                "<h1>Каталог</h1><p>" + ("Страница каталога с завершающим слэшем. " * 20) + "</p>",
+            ))
+            return
         if path == "/about":
             self._send(200, _page(
                 "О нас",
@@ -131,6 +143,7 @@ class Site(BaseHTTPRequestHandler):
                 "<h1>Главная</h1><p>"
                 + ("Проверка технического аудита сайта. " * 40)
                 + "</p>"
+                + '<a href="/catalog/">Каталог</a>'
                 + '<a href="/about">О компании</a>'
                 + '<a href="/gone">Битая</a>'
                 + '<a href="/hop">Прыжок</a>'
@@ -138,6 +151,7 @@ class Site(BaseHTTPRequestHandler):
                 + '<a href="/thin">Короткая</a>'
                 + '<a href="/secret">Секрет</a>'
                 + '<a href="/closed">Закрытая</a>'
+                + '<a href="/login">Вход</a>'
                 + '<img src="/pic.png">',
                 canonical="/",
                 description="Главная тестового сайта для проверки технического аудита, ссылок и карты сайта.",
@@ -166,10 +180,15 @@ class AuditTests(unittest.TestCase):
     def test_normalize_and_private_urls(self):
         self.assertEqual(
             normalize("HTTPS://Example.COM/a/?utm_source=z&b=1"),
-            "https://example.com/a?b=1",
+            "https://example.com/a/?b=1",
         )
-        self.assertEqual(normalize("https://example.com/a/"), "https://example.com/a")
+        self.assertEqual(normalize("https://example.com/a/"), "https://example.com/a/")
+        self.assertEqual(normalize("https://example.com/a"), "https://example.com/a")
         self.assertEqual(normalize("https://example.com/"), "https://example.com/")
+        from engine.urls import same_document
+        self.assertTrue(same_document("https://example.com/a/", "https://www.example.com/a"))
+        self.assertTrue(same_document("http://example.com/a/", "https://example.com/a"))
+        self.assertFalse(same_document("https://example.com/a", "https://example.com/b"))
         for raw in (
             "http://127.0.0.1/",
             "http://169.254.169.254/",
@@ -206,6 +225,12 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(parsed.h1, ["Один"])
         self.assertEqual(parsed.canonical, "https://example.com/a")
         self.assertEqual(parsed.images_missing_alt, 1)
+        decorative = parse_html(
+            "<html><head><title>x</title></head><body><img src='/p.png' alt=''></body></html>",
+            "https://example.com/",
+            "example.com",
+        )
+        self.assertEqual(decorative.images_missing_alt, 0)
         self.assertEqual(parsed.internal, ["https://example.com/b"])
         self.assertEqual(parsed.jsonld_ok, 1)
         self.assertIn("http://cdn.example/a.png", parsed.mixed)
@@ -244,21 +269,29 @@ class AuditTests(unittest.TestCase):
             "images-alt",
             "robots-blocked-links",
             "sitemap-orphans",
-            "noindex",
-            "bad-canonical",
         ):
             self.assertIn(issue_id, ids, ids)
         self.assertNotIn("home-down", ids)
         self.assertNotIn("robots-block-all", ids)
+        self.assertNotIn("noindex", ids)
+        self.assertNotIn("bad-canonical", ids)
         urls = [page["url"] for page in report["pages"]]
         self.assertFalse(any(url.endswith("/secret") for url in urls), urls)
         home = next(page for page in report["pages"] if page["depth"] == 0)
         self.assertEqual(home["status"], 200)
         self.assertTrue(home["indexable"], home)
+        catalog = next(page for page in report["pages"] if page["url"].rstrip("/").endswith("/catalog"))
+        self.assertTrue(catalog["url"].endswith("/catalog/"), catalog["url"])
+        self.assertEqual(catalog["status"], 200)
+        redirected = {event["from"] for event in data.redirect_events}
+        self.assertNotIn(self.base + "/catalog", redirected)
+        self.assertNotIn(self.base + "/catalog/", redirected)
         chains = next(item for item in report["issues"] if item["id"] == "redirect-chains")
         self.assertTrue(any("/double" in row for row in chains["examples"]))
         self.assertGreater(report["summary"]["score"], 0)
         self.assertLess(report["summary"]["score"], 90)
+        broken = next(item for item in report["issues"] if item["id"] == "broken-internal")
+        self.assertFalse(any(str(url).endswith("/login") for url in broken["urls"]))
 
     def test_api_rejects_private_and_serves_ui(self):
         request = Request(
@@ -328,6 +361,10 @@ class FormatChecks(unittest.TestCase):
         self.assertEqual(clamp_limits(900_000, 9)[0], 500_000)
 
     def test_unvisited_sitemap_url_is_not_a_404(self):
+        import tempfile
+        from openpyxl import load_workbook
+        from engine.deliver import write_files
+
         home = Page(url="https://shop.example/", status=200, indexable=True, depth=0)
         data = CrawlData(
             start_url="https://shop.example/",
@@ -340,6 +377,36 @@ class FormatChecks(unittest.TestCase):
         )
         report = build_report(data)
         self.assertNotIn("sitemap-errors", {item["id"] for item in report["issues"]})
+        with tempfile.TemporaryDirectory() as folder:
+            write_files(data, Path(folder))
+            book = load_workbook(Path(folder) / "teh-audit-shop.example.xlsx")
+            values = [row[0].value for row in book["Нет на сайте"].iter_rows(min_row=2, max_col=1)]
+            self.assertNotIn("https://shop.example/product", values)
+
+    def test_slash_and_www_canonical_is_not_an_error(self):
+        page = Page(
+            url="https://shop.example/a/",
+            status=200,
+            indexable=True,
+            depth=0,
+            title="Страница каталога товаров магазина",
+            canonical="https://www.shop.example/a",
+        )
+        data = CrawlData(
+            start_url="https://shop.example/a/",
+            final_url=page.url,
+            site_key="shop.example",
+            pages={page.url: page},
+            redirect_events=[{
+                "from": "https://shop.example/a",
+                "to": "https://shop.example/a/",
+                "hops": 1,
+                "chain": [{"status": 301, "location": "https://shop.example/a/"}],
+            }],
+        )
+        ids = {item["id"] for item in build_report(data)["issues"]}
+        self.assertNotIn("bad-canonical", ids)
+        self.assertNotIn("redirect-links", ids)
 
     def test_sitemap_image_counts_as_error(self):
         parsed = analyze_sitemap(
@@ -354,7 +421,7 @@ class FormatChecks(unittest.TestCase):
         self.assertTrue(parsed["ok"])
         self.assertEqual(parsed["pages"], ["https://shop.example/p"])
         self.assertEqual(parsed["images"], [("https://shop.example/p", "https://cdn.example/a.jpg")])
-        self.assertIn("Есть адрес без даты lastmod", parsed["warnings"])
+        self.assertNotIn("Есть адрес без даты lastmod", parsed["warnings"])
 
     def test_sitemap_warning_rules(self):
         parsed = analyze_sitemap(
@@ -373,9 +440,6 @@ class FormatChecks(unittest.TestCase):
         self.assertEqual(
             parsed["warnings"],
             [
-                "В файле есть XML-комментарий",
-                "Есть адрес без даты lastmod",
-                "У изображения в карте пустой caption",
                 "В карте указан файл, а не HTML-страница",
             ],
         )

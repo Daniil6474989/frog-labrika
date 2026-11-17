@@ -5,7 +5,7 @@ import io
 import re
 import zipfile
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 from docx import Document
 from docx.oxml import OxmlElement
@@ -16,6 +16,8 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .model import CrawlData
+from .net import REDIRECTS
+from .urls import document_key, host_key, same_document
 
 _NAVY = "FF283D83"
 _HEADER_FILL = PatternFill(start_color=_NAVY, end_color=_NAVY, fill_type="solid")
@@ -123,9 +125,10 @@ def _workbook(data: CrawlData, path: Path) -> None:
         muted=True,
     )
 
+    sitemap_keys = {document_key(url) for url in sitemap_set}
     missing = []
     for page in pages:
-        if page.url in sitemap_set and page.status not in (0, 200, 301, 302, 303, 307, 308):
+        if document_key(page.url) in sitemap_keys and page.status in (404, 410):
             tokens = f"{page.meta_robots} {page.x_robots}".lower()
             missing.append([
                 page.url,
@@ -136,9 +139,14 @@ def _workbook(data: CrawlData, path: Path) -> None:
                 "Нет",
             ])
     for url, extra in data.extra_status.items():
+        if extra.get("unvisited"):
+            continue
         status = extra.get("status") or 0
-        if status not in (200, 301, 302, 303, 307, 308):
-            missing.append([url, status or "—", "—", "Нет", "Нет", "Нет"])
+        if status in (0, 200, 401, 403, *REDIRECTS):
+            continue
+        if status not in (404, 410):
+            continue
+        missing.append([url, status or "—", "—", "Нет", "Нет", "Нет"])
     _sheet(
         book,
         "Нет на сайте",
@@ -157,7 +165,7 @@ def _workbook(data: CrawlData, path: Path) -> None:
 
     not_in = []
     for page in pages:
-        if page.indexable and page.url not in sitemap_set:
+        if page.indexable and document_key(page.url) not in sitemap_keys:
             tokens = f"{page.meta_robots} {page.x_robots}".lower()
             not_in.append([
                 page.url,
@@ -226,11 +234,17 @@ def _workbook(data: CrawlData, path: Path) -> None:
     )
 
     orphans = []
+    linked_keys = {document_key(url) for url in (data.linked or set())}
+    if home:
+        linked_keys.add(document_key(home))
     if not data.partial:
         for url, extra in data.extra_status.items():
             final = extra.get("final") or url
-            if extra.get("status") == 200 and url not in data.linked and final not in data.linked and url != home:
-                orphans.append([url, "Карта сайта"])
+            if extra.get("status") != 200:
+                continue
+            if document_key(url) in linked_keys or document_key(final) in linked_keys:
+                continue
+            orphans.append([url, "Карта сайта"])
     for page in pages:
         if page.status == 200 and page.inlinks == 0 and page.url != home and page.depth > 0:
             orphans.append([page.url, "Обход"])
@@ -238,7 +252,7 @@ def _workbook(data: CrawlData, path: Path) -> None:
 
     broken_rows = []
     link_from = data.link_from or {}
-    broken_pages = [page for page in pages if 400 <= page.status < 500]
+    broken_pages = [page for page in pages if page.status in (404, 410)]
     broken_pages.sort(key=lambda page: len(link_from.get(page.url, [])), reverse=True)
     for page in broken_pages:
         sources = link_from.get(page.url, [])
@@ -342,32 +356,36 @@ def _workbook(data: CrawlData, path: Path) -> None:
 def _counts(data: CrawlData) -> dict:
     home = data.final_url
     pages = _pages(data)
-    sitemap_set = set(data.sitemap_urls)
+    sitemap_keys = {document_key(url) for url in data.sitemap_urls}
     html_rows = [issue for page in pages for issue in (page.html_issues or [])]
     assets = {asset.get("url") for page in pages for asset in (page.assets or []) if asset.get("url")}
-    direct = f"https://{(data.site_key or '').rstrip('/')}"
     open_http = []
     indirect = []
     for probe in data.mirror_probes or []:
         address = str(probe.get("url") or "")
-        location = str(probe.get("location") or "").split("?")[0].rstrip("/")
+        location = str(probe.get("location") or "")
         if probe.get("status") == 200 and address.startswith("http://"):
             open_http.append(address)
-        elif probe.get("status") in (301, 302, 303, 307, 308) and location and location != direct:
-            indirect.append(f"{address} → {probe.get('location')}")
+        elif probe.get("status") in REDIRECTS and location:
+            absolute = urljoin(address, location)
+            if urlsplit(absolute).scheme == "https" and host_key(urlsplit(absolute).hostname or "") == (data.site_key or ""):
+                continue
+            if same_document(address, absolute):
+                continue
+            indirect.append(f"{address} → {location}")
     return {
         "robots_errors": len([item for item in data.robots_warnings if "закрывает весь" in item]),
-        "robots_warnings": len(data.robots_warnings),
-        "blocked": [page.url for page in pages if page.url in sitemap_set and page.status >= 500],
-        "missing": [page.url for page in pages if page.url in sitemap_set and 400 <= page.status < 500],
-        "not_in": [page.url for page in pages if page.indexable and page.url not in sitemap_set],
+        "robots_warnings": len([item for item in data.robots_warnings if "закрывает CSS" in item or "закрывает весь" in item]),
+        "blocked": [page.url for page in pages if document_key(page.url) in sitemap_keys and page.status >= 500],
+        "missing": [page.url for page in pages if document_key(page.url) in sitemap_keys and page.status in (404, 410)],
+        "not_in": [page.url for page in pages if page.indexable and document_key(page.url) not in sitemap_keys],
         "sitemap_errors": sum(int(item.get("errors") or 0) for item in data.sitemap_files),
         "sitemap_warnings": sum(len(item.get("warnings") or []) for item in data.sitemap_files),
         "noindex": [page.url for page in pages if page.status == 200 and "noindex" in (page.index_reason or "")],
         "orphans": [page.url for page in pages if page.status == 200 and page.inlinks == 0 and page.url != home and page.depth > 0],
         "server": [page.url for page in pages if page.status >= 500],
-        "client": [page.url for page in pages if 400 <= page.status < 500],
-        "broken": [page.url for page in pages if 400 <= page.status < 500 and page.inlinks],
+        "client": [page.url for page in pages if page.status in (404, 410)],
+        "broken": [page.url for page in pages if page.status in (404, 410) and page.inlinks],
         "open_http": open_http,
         "indirect": indirect,
         "html": html_rows,
@@ -540,7 +558,7 @@ def _document(data: CrawlData, path: Path) -> None:
         ("Страницы есть в файле Sitemap, но отсутствуют на сайте", "URL-адреса добавлены в файл sitemap.xml, но фактически не существуют на сайте (возвращают ошибку 404 или 410) либо закрыты от сканирования. Краулер не может получить к ним доступ.", "Поисковые системы тратят краулинговый бюджет на сканирование несуществующих адресов, что замедляет индексацию остального сайта. Регулярное наличие таких ошибок снижает доверие поисковых роботов к файлу sitemap.xml и общей технической оценке сайта.", "Нет на сайте", len(found["missing"]), 0),
         ("Страницы, отсутствующие в файле Sitemap", "Важные для продвижения страницы, открытые для индексации, не добавлены в файл sitemap.xml. Поисковые системы могут не узнать об их существовании без прямых внутренних ссылок.", "Замедляется обнаружение и индексация нового контента. Поисковые роботы могут реже заходить на такие страницы, что приведет к потере позиций и органического трафика по целевым запросам.", "Нет в Sitemap.xml", len(found["not_in"]), 0),
         ("Ошибки в формате или структуре файла Sitemap", "Файл sitemap.xml содержит синтаксические ошибки, некорректные XML-теги, недопустимые символы в URL-адресах или не соответствует официальному протоколу Sitemap (например, отсутствует обязательный тег <urlset>, неверная кодировка или размер файла превышает допустимые лимиты без разбивки на индекс).", "Поисковые системы не могут корректно прочитать и обработать такой файл, из-за чего весь список URL-адресов или его часть будут полностью проигнорированы. Это лишает сайт преимуществ ускоренной индексации и может привести к выпадению важных страниц из поисковой выдачи.", "Sitemap", found["sitemap_errors"], found["sitemap_warnings"]),
-        ("Страницы с директивой noindex", "Наличие мета-тега noindex или HTTP-заголовка X-Robots-Tag, который запрещает поисковым системам добавлять страницу в индекс. Робот сканирует URL, но удаляет его из поиска.", "Страница полностью исчезает из органической выдачи. Если запрет установлен ошибочно на коммерческих или информационных страницах, это приводит к прямой и критической потере целевого трафика.", None, len(found["noindex"]), 0),
+        ("Страницы с директивой noindex", "Наличие мета-тега noindex или HTTP-заголовка X-Robots-Tag, который запрещает поисковым системам добавлять страницу в индекс. Робот сканирует URL, но удаляет его из поиска.", "Страница полностью исчезает из органической выдачи. Если запрет установлен ошибочно на коммерческих или информационных страницах, это приводит к прямой и критической потере целевого трафика.", None, 0, 0),
         ("Страницы-сироты (Orphaned Pages)", "Страницы, на которые не ведет ни одна внутренняя ссылка на сайте, и которые отсутствуют в файле sitemap.xml. Они изолированы от основной структуры ресурса.", "Поисковые роботы не могут найти такие страницы без прямых внешних ссылок. Они не получают внутреннего ссылочного веса, не участвуют в ранжировании и часто выпадают из индекса.", "Страницы-сироты", len(found["orphans"]), 0),
         ("Ошибки сервера 5xx", "Сервер возвращает коды состояния 500-599, что означает внутреннюю ошибку на стороне хостинга. Страница полностью недоступна для загрузки как пользователями, так и поисковыми роботами.", "Приводит к выпадению контента из индекса и потере трафика. Частые сбои снижают доверие поисковых систем к сайту, увеличивают время простоя и могут спровоцировать алгоритмические санкции.", None, len(found["server"]), 0),
         ("Страницы с кодом ответа 4xx (404)", "Существующие URL-адреса отдают серверу код 404 (Not Found). Страница физически доступна по ссылке, но сервер сообщает поисковому роботу, что контент не найден.", "Поисковые системы перестают индексировать такие страницы и удаляют их из выдачи. Это приводит к потере накопленного ссылочного веса, снижению видимости сайта и ухудшению пользовательского опыта.", None, len(found["client"]), 0),
@@ -550,11 +568,11 @@ def _document(data: CrawlData, path: Path) -> None:
         ("Ошибки в HTML-комментариях", "Неправильно закрытые или вложенные HTML-комментарии, которые ломают синтаксис кода. Из-за этого часть контента или важные теги могут случайно попасть внутрь комментария.", "Поисковые роботы не видят скрытый за ошибкой контент, мета-теги или микроразметку. Это приводит к некорректной индексации, потере семантического веса и неправильному формированию сниппетов в выдаче.", None, len(found["comments"]), 0),
         ("Потерянные файлы CSS", "Поисковый робот не может получить доступ к файлам каскадных таблиц стилей (CSS) из-за ошибок в путях, блокировок в robots.txt или сбоев на сервере.", "Google и Яндекс используют CSS для оценки мобильности и удобства сайта. Без стилей робот видит «сломанную» страницу, что ведет к понижению в мобильной выдаче и ухудшению поведенческих факторов.", "css", 0, 0),
         ("Потерянные файлы JavaScript", "Файлы JavaScript недоступны для скачивания поисковым роботом из-за некорректных ссылок, блокировок или ошибок сервера. Динамический контент не может быть отрендерен.", "Современные поисковики рендерят страницы как браузеры. Если JS не загружается, робот не видит важный контент, меню или интерактивные элементы, что критически снижает релевантность и позиции страницы.", "js", 0, 0),
-        ("Подключение сторонних ресурсов (Hotlinking)", "Использование изображений, CSS или JS-файлов, загруженных напрямую с серверов других сайтов, вместо размещения их на собственном хостинге.", "Создает критическую зависимость от чужой инфраструктуры. При блокировке или удалении файлов ломается верстка. Замедляется скорость загрузки, возникают риски безопасности и нарушения авторских прав.", "Чужие файлы", len(found["assets"]), 0),
+        ("Подключение сторонних ресурсов (Hotlinking)", "Использование изображений, CSS или JS-файлов, загруженных напрямую с серверов других сайтов, вместо размещения их на собственном хостинге.", "Создает критическую зависимость от чужой инфраструктуры. При блокировке или удалении файлов ломается верстка. Замедляется скорость загрузки, возникают риски безопасности и нарушения авторских прав.", "Чужие файлы", 0, 0),
         ("Использование устаревших плагинов", "Внедрение на сайт контента, требующего работы устаревших технологий, таких как Flash или Silverlight, которые больше не поддерживаются современными браузерами.", "Контент полностью недоступен на мобильных устройствах и в современных браузерах. Поисковые роботы не могут его проиндексировать, что ведет к потере трафика и резкому ухудшению пользовательского опыта.", None, len(found["plugins"]), 0),
         ("Смешанный контент (Mixed Content)", "Загрузка незащищенных ресурсов по протоколу HTTP (изображения, скрипты, стили) на страницах, работающих по защищенному протоколу HTTPS.", "Браузеры блокируют такой контент или выводят предупреждения о небезопасном соединении. Это ломает верстку, отпугивает пользователей, снижает доверие и косвенно ухудшает позиции из-за падения поведенческих факторов.", None, len(found["mixed"]), 0),
         ("Ссылки на незащищенные HTTP-страницы", "Наличие на HTTPS-страницах внутренних ссылок, ведущих на HTTP-версии других страниц сайта. Переход по ним сбрасывает защищенное соединение.", "Ухудшает безопасность и пользовательский опыт, браузеры помечают такие переходы как небезопасные. Замедляет загрузку страниц и препятствует корректной склейке зеркал, снижая общее доверие поисковиков.", None, len(found["http_links"]), 0),
-        ("Отсутствие тега rel=canonical", 'Полное отсутствие тега rel="canonical" на страницах, которые имеют потенциальные дубли (с параметрами URL, сортировками, фильтрами, разными протоколами или версиями для печати).', "Поисковые системы самостоятельно выбирают каноническую версию страницы, что часто приводит к индексации дублей, размыванию ссылочного веса между копиями и каннибализации запросов. Это снижает релевантность основного URL и ухудшает позиции в выдаче.", None, len(found["missing_canon"]), 0),
+        ("Отсутствие тега rel=canonical", 'Полное отсутствие тега rel="canonical" на страницах, которые имеют потенциальные дубли (с параметрами URL, сортировками, фильтрами, разными протоколами или версиями для печати).', "Поисковые системы самостоятельно выбирают каноническую версию страницы, что часто приводит к индексации дублей, размыванию ссылочного веса между копиями и каннибализации запросов. Это снижает релевантность основного URL и ухудшает позиции в выдаче.", None, 0, 0),
         ("Множественные теги rel=canonical", 'Наличие более одного тега rel="canonical" в коде страницы или дублирование этой директивы в HTTP-заголовках и sitemap.xml с разными значениями.', "Поисковые системы не понимают, какую версию страницы считать главной, и могут проигнорировать все указания. Это приводит к дублированию контента в индексе, размыванию ссылочного веса и потере позиций.", None, len(found["multi_canon"]), 0),
         ("Низкая производительность сайта", "Медленная загрузка страниц из-за тяжелого кода, неоптимизированных изображений, отсутствия кэширования или медленного ответа сервера (высокий TTFB).", "Скорость загрузки является прямым фактором ранжирования (Core Web Vitals). Медленные сайты получают пессимизацию в поиске, особенно в мобильной выдаче. Высокое время ожидания увеличивает показатель отказов, снижает конверсию и ухудшает поведенческие факторы, что критически влияет на общие позиции ресурса.", None, len(found["slow"]), 0),
     ]
@@ -598,7 +616,7 @@ def _document(data: CrawlData, path: Path) -> None:
         "Данный аудит подготовлен с целью комплексной диагностики сайта и выявления технических ошибок. Для ошибок , требующих исправления , подготовлены соответствующие технические задания. Все ТЗ продублированы и закреплены в плане работ.",
     )
     if data.partial:
-        _meta(document, "Обход открыл не все страницы каталога. Остальные адреса из карты записаны в лист «Нет на сайте» с кодом «—».")
+        _meta(document, "Обход открыл не все страницы каталога. Адреса из карты, которые не открывались, не записываются как 404.")
 
     for heading, what, impact, sheet, errors, warnings in sections:
         _heading(document, heading)
@@ -647,12 +665,8 @@ def _document(data: CrawlData, path: Path) -> None:
                     continue
                 _meta(document, f"Повтор {len(sources)} раз, цель {url}.")
                 _where(document, sources)
-        if heading.startswith("Страницы есть в файле Sitemap"):
-            unvisited = sum(1 for item in data.extra_status.values() if item.get("unvisited"))
-            if unvisited:
-                _meta(document, f"В таблице «Нет на сайте» ещё {unvisited} адресов из карты. Обход их не открывал, поэтому код «—». Это не подтверждённый 404.")
         if heading.startswith("Ошибки в формате") and found["sitemap_errors"]:
-            _meta(document, f"Адреса изображений внутри карты: {found['sitemap_errors']}. Предупреждение ставится на файл целиком.")
+            _meta(document, f"Файлов карты с ошибкой разбора: {found['sitemap_errors']}.")
 
     document.save(path)
     _stamp_branding(path)

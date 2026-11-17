@@ -56,8 +56,6 @@ def robots_warnings(text: str) -> list[str]:
 
 def analyze_sitemap(text: str) -> dict:
     warnings: list[str] = []
-    if "<!--" in text:
-        warnings.append("В файле есть XML-комментарий")
     try:
         root = ET.fromstring(text)
     except ET.ParseError as exc:
@@ -88,40 +86,27 @@ def analyze_sitemap(text: str) -> dict:
         }
     pages: list[str] = []
     images: list[tuple[str, str]] = []
-    missing_lastmod = False
-    empty_caption = False
     file_page = False
     for node in root:
         if _local(node.tag) != "url":
             continue
         loc = ""
-        has_lastmod = False
         pictures: list[str] = []
         for child in node:
             name = _local(child.tag)
             if name == "loc" and child.text and not loc:
                 loc = child.text.strip()
-            elif name == "lastmod":
-                has_lastmod = True
             elif name == "image":
                 for sub in child.iter():
                     sub_name = _local(sub.tag)
                     if sub_name == "loc" and sub.text:
                         pictures.append(sub.text.strip())
-                    if sub_name == "caption" and not (sub.text or "").strip():
-                        empty_caption = True
         if loc:
             pages.append(loc)
-            if not has_lastmod:
-                missing_lastmod = True
             if _file_like(loc):
                 file_page = True
         for picture in pictures:
             images.append((loc, picture))
-    if missing_lastmod:
-        warnings.append("Есть адрес без даты lastmod")
-    if empty_caption:
-        warnings.append("У изображения в карте пустой caption")
     if file_page:
         warnings.append("В карте указан файл, а не HTML-страница")
     return {
@@ -189,7 +174,7 @@ def load_sitemaps(seeds, site_key, allow_private, timeout, workers=4, deadline=N
                             "file": url,
                             "page": normalize(page_url) if page_url else "",
                             "image": image_url,
-                            "error": "В карте указан адрес изображения, а не HTML-страница",
+                            "error": "",
                         }
                     )
                 kind = parsed["kind"] or "xml"
@@ -204,7 +189,7 @@ def load_sitemaps(seeds, site_key, allow_private, timeout, workers=4, deadline=N
                         "children": len(parsed["children"]),
                         "items": len(parsed["children"]) if is_index else len(parsed["pages"]) + len(parsed["images"]),
                         "html": 0 if is_index else len(file_pages),
-                        "errors": 1 if not parsed["ok"] else (0 if is_index else len(parsed["images"])),
+                        "errors": 0 if parsed["ok"] else 1,
                         "warnings": parsed["warnings"] if parsed["ok"] else parsed["warnings"] or ["Файл не открылся"],
                         "checked": result.status == 200 and parsed["ok"],
                     }
